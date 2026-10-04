@@ -43,6 +43,42 @@ Free GitHub runners can't hold the whole KDE build, so it's split:
 
 BuildStream settings CI uses live in the checked-in `buildstream-ci.conf`.
 
+#### Remote execution (tromso#311)
+
+The whole plan, core, chunk and merge design exists because this repository
+has no remote executor. Other repositories with one finish the same work in
+18 to 22 minutes. `RazorfinOS-org/cosmic-build-meta` is the clearest proof,
+because it is one repository before and after the change.
+
+`build_final` now takes its config from
+`.github/actions/generate-bst-ci-config`, a port of razorfin's action. The
+action reads two credentials:
+
+| name | kind | purpose |
+| --- | --- | --- |
+| `CASD_CLIENT_CERT` | repository variable | mTLS identity for `cache.projectbluefin.io:11002` |
+| `CASD_CLIENT_KEY` | repository secret | the matching private key |
+
+Neither exists yet, and nobody in this repository can create them. Someone
+must ask the Bluefin maintainers for a client certificate. Until then the
+action writes the committed `buildstream-ci.conf` byte for byte, so the build
+behaves as it did before. `tests/pytest/test_bst_ci_config.py` asserts that
+equality on every pull request.
+
+Two rules protect the change:
+
+- The action stops the job when a caller asks for remote execution and the
+  credentials are absent.
+- The build step greps the console for the `Remote Execution Configuration`
+  banner. A green cache hit does not prove that BuildStream loaded the
+  executor. A quiet fall back to local builds looks like a slow success.
+
+Two steps remain. First, get the certificate. Second, move the junction pins.
+Cache keys are a function of the ref, the patch queue, the options and the
+overrides. A shared cache therefore stays cold while this repository sits on
+freedesktop-sdk 25.08.9 and the others sit on 25.08.16. Delete the chunk
+machinery from the caller only after a remote build passes.
+
 **Cache-key invalidation warning:** a change to the cache key of every element
 causes a full world rebuild. A change to `name:` in `project.conf` is one example.
 Expect chunk jobs to run for hours or reach their six-hour limit once. They
@@ -106,6 +142,9 @@ prompt, and installed desktop.
 
 | 2026-07-19 | Multi-runner never went green since May; every run "cancelled" at ~6.5 h | chunk jobs killed by job-level `timeout-minutes` — a cancelled job never reaches the CAS-push step, so 6 h × 10 chunks of build work was discarded daily (≈720 runner-hours; zero chunk cache packages ever existed on GHCR) | build bounded *inside* the step (`timeout 270m`), push steps `if: always()` — partial CAS salvaged, builds converge across days |
 | 2026-07-19 | Failed chunks could publish their exact-cache-key tag and be skipped forever | `for i in 1 2 3 … done` retry loop exits 0 on total failure (status of last `sleep`) | retry loop removed (bst retry-failed/network-retries already cover it); rc propagated |
+| 2026-10-03 | `build_final` (run 37069338183) fails integrating `oci/kde-linux/filesystem.bst` and `oci/layers/tromso-runtime.bst`: `setcap cap_sys_nice+ep /usr/bin/kwin_wayland` exit 1 | `oci/kde-linux/stack.bst` ran `setcap` as a public integration command; BuildStream's sandbox cannot write `security.capability` xattrs, so every compose that stages the stack failed. Present since May, first hit once chunks stopped timing out | setcap moved to the fakecap-preloaded OCI assembly scripts (`oci/kde-linux/image.bst`, already in `oci/tromso.bst`), the freedesktop-sdk pattern (see its `components/shadow.bst`); build_final now `getcap`s kwin_wayland in the exported image |
+| 2026-10-03 | `build_final` (run 37102603548) fails in `oci/kde-linux/image.bst`: `glib-compile-schemas` exit 127 | the element never declared `components/glib.bst`; first reached once the setcap fix let the compose elements integrate | `freedesktop-sdk.bst:components/glib.bst` added to its build-depends (as `oci/tromso.bst` already has) |
+| 2026-10-04 | First published `tromso:latest` breaks the ISO/E2E `container` recipe: `buildah commit --squash` fails with `lstat /etc/alsa/conf.d/50-arcam-av-ctl.conf: no such file or directory`; 65 `c?????????` entries in the mounted image | freedesktop-sdk build-oci `analyze_lowers()` dropped only the directory entry on a `.wh.<dir>` whiteout, not its descendants. The kde-linux layer whites out `/etc/alsa` (and `/etc/fonts`, `/usr/share/licenses/freedesktop-sdk`); the tromso layer recreates them and build-oci then emitted whiteouts for files that no longer exist. Over a whiteout the recreated directory is not merged, so overlayfs lists those whiteouts as unstattable char devices | `patches/freedesktop-sdk/0012` fixes `analyze_lowers()`; build_final fails on any char device in the exported image; `.gitignore` no longer swallows new `patches/` files |
 
 | 2026-07-20 | Multi-runner `build_deps` chunk jobs queued for 20+ min when `tromso` and `xfce-linux` built simultaneously | Simultaneous schedule triggers and push builds across repos reached free-tier org concurrency cap (~20 jobs) | Removed push triggers; staggered daily crons (xfce-linux at 23:30 UTC, tromso at 00:30 UTC) and accepted residual manual-dispatch contention as free-runner trade-off (tromso#93) |
 | 2026-08-12 | Daily `chore(deps): track element sources` PR red on `Build changed elements` (`tromso/glow.bst`: `go: download go1.26.5 … lookup proxy.golang.org … connection refused`) | `glow.bst`/`gum.bst` run `go mod download` in build-commands, but the BuildStream sandbox has no network; they are orphaned (absent from `tromso/deps.bst`), so the world build never built them and only a ref bump touching the file exposes it. glow v3.0.0 additionally wants a Go toolchain newer than freedesktop-sdk 25.08 ships | Both excluded from `track-bst-sources.yml` via `TRACK_EXCLUDE` so a broken element can't block buildable ref bumps. #180 merged red, so glow stays at v3.0.0 on main: reverting the ref would touch the file and trip the same gate. Re-include (and repair the ref) once they vendor modules (`-mod=vendor`, as `uupd.bst` and `kde-linux-deps/toolbox.bst` do) |
