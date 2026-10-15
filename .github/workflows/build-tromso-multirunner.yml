@@ -129,7 +129,7 @@ jobs:
   build_final:
     needs: multirunner
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
-    # ⚠️ Was Blacksmith build-amd64 (32-core) final assembly. Now 2-core
+    # ⚠️ Was 32-core build-amd64 final assembly. Now 2-core
     # GitHub-hosted — candidate for larger runner/kanpur if it nears 6h.
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -214,6 +214,14 @@ jobs:
         with:
           enable-remote-execution: ${{ vars.CASD_CLIENT_CERT != '' }}
           enable-push: 'true'
+
+      # Stamp os-release with this commit's date. Without it the image ships
+      # the committed local default VERSION_ID="l.1" (include/image-version.yml).
+      # The recipe reads only HEAD, so the default depth-1 checkout is enough.
+      - name: Generate image version
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: just generate-image-version "$BRANCH"
 
       - name: Build Final Target
         env:
@@ -432,7 +440,7 @@ jobs:
   build_final_aarch64:
     needs: multirunner_aarch64
     if: needs.multirunner_aarch64.result == 'success'
-    # ⚠️ Was Blacksmith build-arm64 (32-core) final assembly. Now 2-core
+    # ⚠️ Was 32-core build-arm64 final assembly. Now 2-core
     # GitHub-hosted arm64 — candidate for larger runner/kanpur if slow.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
@@ -514,6 +522,14 @@ jobs:
         with:
           enable-remote-execution: 'false'
           enable-push: 'true'
+
+      # Stamp os-release with this commit's date. Without it the image ships
+      # the committed local default VERSION_ID="l.1" (include/image-version.yml).
+      # The recipe reads only HEAD, so the default depth-1 checkout is enough.
+      - name: Generate image version
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: just generate-image-version "$BRANCH"
 
       - name: Build Final Target
         env:
