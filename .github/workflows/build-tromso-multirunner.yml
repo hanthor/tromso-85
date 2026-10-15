@@ -118,12 +118,18 @@ jobs:
       # A timed-out chunk still publishes only `:latest`, never its exact-key
       # tag, so nothing is ever marked complete that isn't.
       soft_chunk_budget: true
+      # 270m (the bst-ci default) does not fit: run 36824268469's chunk3
+      # spent 38 min restoring caches, 270 min building, then was cancelled
+      # 57 min into pushing its CAS at the 360-minute job limit, so the
+      # salvage never landed and the chunk could never make progress.
+      # 200m leaves ~2h for restore + archive/push.
+      chunk_budget_minutes: "200"
 
   # ── Phase 4: Final assembly + push ──────────────────────────────────
   build_final:
     needs: multirunner
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
-    # ⚠️ Was Blacksmith build-amd64 (32-core) final assembly. Now 2-core
+    # ⚠️ Was 32-core build-amd64 final assembly. Now 2-core
     # GitHub-hosted — candidate for larger runner/kanpur if it nears 6h.
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -167,39 +173,26 @@ jobs:
           mkdir -p ~/.cache/buildstream
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
 
-          if oras pull "ghcr.io/${REPO_LOWER}/cache-${IMAGE_NAME}-core:latest" -o .; then
-            if [ -f cas-core.tar.zst ]; then
-              # --exclude=sources: each pushed tarball is a full
-              # ~/.cache/buildstream snapshot (see the archive step in
-              # tuna-os/bst-ci's multirunner-build.yml), source downloads
-              # included. build_final only needs the built artifacts (cas/)
-              # to assemble final_target — every element it references is
-              # already cached, so it never re-stages sources for them.
-              # Merging 11 full per-chunk sources/ trees onto one small
-              # runner disk is what exhausted it in run 33295159787
-              # ("No space left on device" mid-extract); skipping sources/
-              # here cuts what actually hits disk to the artifacts we use.
-              zstd -d -c -T0 cas-core.tar.zst | tar --exclude=sources -xf - -C "$HOME/.cache/buildstream"
-              rm -f cas-core.tar.zst
-            fi
-          fi
+          # Streamed, never staged: `oras pull -o .` wrote each tarball to the
+          # runner disk next to the cache it was unpacking into, and build_final
+          # in run 36971374464 died in this step with "No space left on device".
+          # scripts/cas-restore-stream.sh pipes the blob through zstd and tar
+          # (sources/ excluded) and resumes GHCR's mid-stream PROTOCOL_ERROR
+          # cuts. A missing chunk costs rebuild time here, never correctness.
+          BASE="ghcr.io/${REPO_LOWER}/cache-${IMAGE_NAME}"
+          scripts/cas-restore-stream.sh "${BASE}-core:latest" \
+            || echo "::warning::core CAS unavailable — build_final rebuilds it"
+          df -h /
 
           echo "$MATRIX_KEYS" | jq -r '.[]' | while read -r chunk; do
             CACHE_KEY=$(echo "$CACHE_KEYS" | jq -r --arg c "$chunk" '.[$c] // empty')
-            PULLED=false
-            if [ -n "$CACHE_KEY" ]; then
-              if oras pull "ghcr.io/${REPO_LOWER}/cache-${IMAGE_NAME}-${chunk}:${CACHE_KEY}" -o .; then
-                PULLED=true
-              fi
+            if [ -n "$CACHE_KEY" ] \
+               && scripts/cas-restore-stream.sh "${BASE}-${chunk}:${CACHE_KEY}"; then
+              :
+            elif ! scripts/cas-restore-stream.sh "${BASE}-${chunk}:latest"; then
+              echo "::warning::no CAS for ${chunk} — build_final rebuilds it"
             fi
-            if [ "$PULLED" = "false" ]; then
-              oras pull "ghcr.io/${REPO_LOWER}/cache-${IMAGE_NAME}-${chunk}:latest" -o . || continue
-            fi
-            TARBALL="cas-${chunk}.tar.zst"
-            if [ -f "$TARBALL" ]; then
-              zstd -d -c -T0 "$TARBALL" | tar --exclude=sources -xf - -C "$HOME/.cache/buildstream"
-              rm -f "$TARBALL"
-            fi
+            df -h /
           done
           du -sh ~/.cache/buildstream
 
@@ -222,6 +215,14 @@ jobs:
           enable-remote-execution: ${{ vars.CASD_CLIENT_CERT != '' }}
           enable-push: 'true'
 
+      # Stamp os-release with this commit's date. Without it the image ships
+      # the committed local default VERSION_ID="l.1" (include/image-version.yml).
+      # The recipe reads only HEAD, so the default depth-1 checkout is enough.
+      - name: Generate image version
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: just generate-image-version "$BRANCH"
+
       - name: Build Final Target
         env:
           BST_FLAGS: --no-interactive --config /src/buildstream-ci.conf
@@ -242,6 +243,23 @@ jobs:
         if: always()
         run: rm -f client.key client.crt
 
+      - name: Check out the artifact and free the CAS
+        env:
+          BST_FLAGS: --no-interactive --config /src/buildstream-ci.conf
+        run: |
+          # The merged CAS and the squashed image do not fit on one runner
+          # together (xfce-linux#159 hit exactly this). Take the artifact out
+          # of the cache, then drop the cache; export works from .build-out.
+          df -h /
+          rm -rf .build-out
+          just bst artifact checkout \
+            "${{ needs.multirunner.outputs.final_target }}" --directory /src/.build-out
+          du -sh .build-out
+          # Removed inside the bst container: its root owns the cache tree.
+          podman run --rm -v "${HOME}/.cache/buildstream:/cache:rw" "$BST2_IMAGE" \
+            sh -c 'rm -rf /cache/cas /cache/artifacts /cache/sources'
+          df -h /
+
       - name: Capture build timestamp
         id: timestamp
         run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
@@ -254,6 +272,8 @@ jobs:
           OCI_IMAGE_REVISION: ${{ github.sha }}
           OCI_IMAGE_VERSION: latest
           OCI_IMAGE_CREATED: ${{ steps.timestamp.outputs.created }}
+          # The CAS is gone by now (previous step); .build-out is the artifact.
+          EXPORT_REUSE_CHECKOUT: '1'
         run: |
           just export
           echo "image_ref=${{ env.IMAGE_NAME }}:latest" >> "$GITHUB_OUTPUT"
@@ -262,6 +282,29 @@ jobs:
         run: |
           sudo podman images
           just lint
+          # kwin_wayland's cap_sys_nice is set under fakecap during OCI
+          # assembly (the bst sandbox cannot setcap). Fail if it did not
+          # survive build-oci, the podman import and the export re-tag.
+          ref="localhost/${{ steps.export.outputs.image_ref }}"
+          mnt=$(sudo podman image mount "$ref")
+          caps=$(sudo getcap "$mnt/usr/bin/kwin_wayland" || true)
+          # A whiteout that build-oci emits under a directory a lower layer
+          # already whited out surfaces in the merged tree as a character
+          # device that cannot be stat'ed, and buildah commit (the ISO
+          # pipeline's squash) dies on it. The image ships no device nodes,
+          # so any character device here is one of those.
+          leaked=$(sudo find "$mnt" -xdev -type c 2>/dev/null | sed "s|^$mnt||" || true)
+          sudo podman image umount "$ref" >/dev/null
+          if [ -n "$leaked" ]; then
+            echo "$leaked" | head -50
+            echo "::error::$(echo "$leaked" | wc -l) leaked overlay whiteouts in the exported image"
+            exit 1
+          fi
+          echo "getcap: ${caps:-<none>}"
+          case "$caps" in
+            *cap_sys_nice*) ;;
+            *) echo "::error::/usr/bin/kwin_wayland lacks cap_sys_nice in the exported image"; exit 1 ;;
+          esac
 
       - name: Upload build logs
         if: always()
@@ -295,12 +338,16 @@ jobs:
             sudo podman tag "localhost/${{ steps.export.outputs.image_ref }}" \
               "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${tag}"
             for i in 1 2 3; do
-              sudo podman push "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${tag}" && break
+              sudo podman push --digestfile "/tmp/digest-${tag}" \
+                "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${tag}" && break
               echo "Retry $i..."; sleep 5
             done
           done
-          digest=$(sudo podman inspect "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
-            --format '{{.Digest}}')
+          # The digest of the manifest as pushed. `podman inspect .Digest` on
+          # the local image is the digest it was imported with, which push
+          # changes by recompressing the layers; cosign then 404s on it (run
+          # 37128881064).
+          digest=$(sudo cat "/tmp/digest-${{ github.sha }}")
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
@@ -382,12 +429,18 @@ jobs:
       # certainly exhaust the budget — the same reasoning applies with more
       # force, and it still cannot publish an unsuffixed tag either way.
       soft_chunk_budget: true
+      # 270m (the bst-ci default) does not fit: run 36824268469's chunk3
+      # spent 38 min restoring caches, 270 min building, then was cancelled
+      # 57 min into pushing its CAS at the 360-minute job limit, so the
+      # salvage never landed and the chunk could never make progress.
+      # 200m leaves ~2h for restore + archive/push.
+      chunk_budget_minutes: "200"
       arch: aarch64
 
   build_final_aarch64:
     needs: multirunner_aarch64
     if: needs.multirunner_aarch64.result == 'success'
-    # ⚠️ Was Blacksmith build-arm64 (32-core) final assembly. Now 2-core
+    # ⚠️ Was 32-core build-arm64 final assembly. Now 2-core
     # GitHub-hosted arm64 — candidate for larger runner/kanpur if slow.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
@@ -433,33 +486,26 @@ jobs:
           mkdir -p ~/.cache/buildstream
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
 
-          if oras pull "ghcr.io/${REPO_LOWER}/cache-${IMAGE_NAME}${ARCH_SUFFIX}-core:latest" -o .; then
-            if [ -f cas-core.tar.zst ]; then
-              # --exclude=sources: see the x86_64 build_final job above —
-              # build_final only needs cas/ to assemble final_target, and
-              # merging every chunk's full sources/ tree onto one runner
-              # disk is what exhausted it in run 33295159787.
-              zstd -d -c -T0 cas-core.tar.zst | tar --exclude=sources -xf - -C "$HOME/.cache/buildstream"
-              rm -f cas-core.tar.zst
-            fi
-          fi
+          # Streamed, never staged: `oras pull -o .` wrote each tarball to the
+          # runner disk next to the cache it was unpacking into, and build_final
+          # in run 36971374464 died in this step with "No space left on device".
+          # scripts/cas-restore-stream.sh pipes the blob through zstd and tar
+          # (sources/ excluded) and resumes GHCR's mid-stream PROTOCOL_ERROR
+          # cuts. A missing chunk costs rebuild time here, never correctness.
+          BASE="ghcr.io/${REPO_LOWER}/cache-${IMAGE_NAME}${ARCH_SUFFIX}"
+          scripts/cas-restore-stream.sh "${BASE}-core:latest" \
+            || echo "::warning::core CAS unavailable — build_final rebuilds it"
+          df -h /
 
           echo "$MATRIX_KEYS" | jq -r '.[]' | while read -r chunk; do
             CACHE_KEY=$(echo "$CACHE_KEYS" | jq -r --arg c "$chunk" '.[$c] // empty')
-            PULLED=false
-            if [ -n "$CACHE_KEY" ]; then
-              if oras pull "ghcr.io/${REPO_LOWER}/cache-${IMAGE_NAME}${ARCH_SUFFIX}-${chunk}:${CACHE_KEY}" -o .; then
-                PULLED=true
-              fi
+            if [ -n "$CACHE_KEY" ] \
+               && scripts/cas-restore-stream.sh "${BASE}-${chunk}:${CACHE_KEY}"; then
+              :
+            elif ! scripts/cas-restore-stream.sh "${BASE}-${chunk}:latest"; then
+              echo "::warning::no CAS for ${chunk} — build_final rebuilds it"
             fi
-            if [ "$PULLED" = "false" ]; then
-              oras pull "ghcr.io/${REPO_LOWER}/cache-${IMAGE_NAME}${ARCH_SUFFIX}-${chunk}:latest" -o . || continue
-            fi
-            TARBALL="cas-${chunk}.tar.zst"
-            if [ -f "$TARBALL" ]; then
-              zstd -d -c -T0 "$TARBALL" | tar --exclude=sources -xf - -C "$HOME/.cache/buildstream"
-              rm -f "$TARBALL"
-            fi
+            df -h /
           done
           du -sh ~/.cache/buildstream
 
@@ -476,6 +522,14 @@ jobs:
         with:
           enable-remote-execution: 'false'
           enable-push: 'true'
+
+      # Stamp os-release with this commit's date. Without it the image ships
+      # the committed local default VERSION_ID="l.1" (include/image-version.yml).
+      # The recipe reads only HEAD, so the default depth-1 checkout is enough.
+      - name: Generate image version
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: just generate-image-version "$BRANCH"
 
       - name: Build Final Target
         env:
@@ -542,12 +596,16 @@ jobs:
             sudo podman tag "localhost/${{ steps.export.outputs.image_ref }}" \
               "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${tag}"
             for i in 1 2 3; do
-              sudo podman push "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${tag}" && break
+              sudo podman push --digestfile "/tmp/digest-${tag}" \
+                "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${tag}" && break
               echo "Retry $i..."; sleep 5
             done
           done
-          digest=$(sudo podman inspect "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-aarch64" \
-            --format '{{.Digest}}')
+          # The digest of the manifest as pushed. `podman inspect .Digest` on
+          # the local image is the digest it was imported with, which push
+          # changes by recompressing the layers; cosign then 404s on it (run
+          # 37128881064).
+          digest=$(sudo cat "/tmp/digest-${{ github.sha }}-aarch64")
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign

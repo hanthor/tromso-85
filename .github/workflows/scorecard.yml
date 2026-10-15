@@ -15,6 +15,10 @@ on:
 
 permissions: read-all
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   analysis:
     name: Scorecard analysis
@@ -32,7 +36,7 @@ jobs:
       - name: Run analysis
         # ossf/scorecard-action publishes no floating major tag, so `@v2`
         # never resolved and this job failed in ~3s on every push.
-        uses: ossf/scorecard-action@v2.4.4
+        uses: ossf/scorecard-action@v2.5.0
         with:
           results_file: results.sarif
           results_format: sarif
